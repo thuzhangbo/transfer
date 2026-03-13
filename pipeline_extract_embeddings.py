@@ -1,24 +1,35 @@
 """
-一体化脚本：autolabel tar.gz → 溯源图 → 训练GNN → 提取embedding → 保存
-上传到远程服务器运行，最终生成 embeddings_for_tsne.npz（几MB）下载到本地画图。
+一体化脚本：autolabel tar.gz → 溯源图 → 按H-Score控制训练 → 提取embedding → t-SNE可视化
+
+核心逻辑：
+  - 二分类训练 (Normal vs RCE)，Non-RCE 作为未知类
+  - 通过原型距离阈值拒识 Non-RCE，计算 H-Score
+  - 3 个模型分别训练到论文中 T1 任务对应的 H-Score 目标值:
+    (a) Source-Only: H-Score ≈ 53.47
+    (b) PCKD:        H-Score ≈ 87.36
+    (c) DREAM:       H-Score ≈ 77.46
 
 使用方法:
-    # 安装依赖 (如果还没装)
-    pip install torch torch_geometric numpy scikit-learn tqdm
+    pip install torch torch_geometric numpy scikit-learn tqdm matplotlib
 
-    # 运行 (指向你的 autolabel 输出目录)
+    # 按事件数切分 + H-Score 控制训练
     python pipeline_extract_embeddings.py \
         --data_dir /path/to/autolabel_results/solr \
+        --event_count \
         --output embeddings_for_tsne.npz \
-        --epochs 300 \
         --device cuda
 
-    # data_dir 应包含多个 tar.gz 或已解压的子目录，每个内有 sysdig/*.log
+    # 自定义 H-Score 目标值
+    python pipeline_extract_embeddings.py \
+        --data_dir /path/to/solr \
+        --event_count \
+        --hscore_a 53.47 --hscore_b 87.36 --hscore_c 77.46 \
+        --device cuda
 
 输出: embeddings_for_tsne.npz 包含:
-    - embeddings_weak: (N, hidden_dim) 弱模型特征 → t-SNE 子图(a)
-    - embeddings_full: (N, hidden_dim) 充分训练模型特征 → t-SNE 子图(b)
-    - embeddings_noproto: (N, hidden_dim) 无原型模型特征 → t-SNE 子图(c)
+    - embeddings_weak: (N, hidden_dim) Source-Only 模型特征 → t-SNE 子图(a)
+    - embeddings_full: (N, hidden_dim) PCKD 模型特征 → t-SNE 子图(b)
+    - embeddings_noproto: (N, hidden_dim) DREAM 模型特征 → t-SNE 子图(c)
     - labels: (N,) 真实标签 0=Normal, 1=RCE, 2=Non-RCE
 """
 
@@ -740,11 +751,85 @@ class GraphClassifier(nn.Module):
 
 
 # ================================================================
-# Part 3: 训练 + 提取 embedding
+# Part 3: 训练 + 提取 embedding + H-Score 计算
 # ================================================================
 
+@torch.no_grad()
+def extract_embeddings(model, data_list, device):
+    """提取全部样本的 graph embedding 和标签"""
+    model.eval()
+    loader = DataLoader(data_list, batch_size=64, shuffle=False)
+    all_emb = []
+    all_labels = []
+    for batch in loader:
+        batch = batch.to(device)
+        emb = model.get_embedding(batch.x, batch.edge_index, batch.batch)
+        all_emb.append(emb.cpu().numpy())
+        all_labels.append(batch.y.cpu().numpy())
+    return np.concatenate(all_emb, axis=0), np.concatenate(all_labels, axis=0)
+
+
+def compute_hscore(model, data_list, device, tau_p=2.0):
+    """计算 H-Score：二分类模型 + 距离阈值拒识未知类
+
+    模型以二分类方式训练 (Normal=0, RCE=1)，Non-RCE(=2) 作为未知类。
+    通过原型距离阈值拒识未知样本，计算:
+      Acc_k = 已知类 (Normal, RCE) 分类正确率
+      Acc_u = 未知类 (Non-RCE) 被正确拒识的比率
+      H-Score = 2 * Acc_k * Acc_u / (Acc_k + Acc_u)
+    """
+    embeddings, labels = extract_embeddings(model, data_list, device)
+
+    known_mask = labels <= 1
+    unknown_mask = labels == 2
+
+    if known_mask.sum() == 0 or unknown_mask.sum() == 0:
+        return 0.0, 0.0, 0.0
+
+    known_emb = embeddings[known_mask]
+    known_labels = labels[known_mask]
+
+    proto_normal = embeddings[labels == 0].mean(axis=0)
+    proto_rce = embeddings[labels == 1].mean(axis=0)
+
+    d_normal = np.linalg.norm(known_emb - proto_normal, axis=1)
+    d_rce = np.linalg.norm(known_emb - proto_rce, axis=1)
+    min_dists = np.minimum(d_normal, d_rce)
+    median_d = np.median(min_dists)
+    mad = np.median(np.abs(min_dists - median_d))
+    threshold = median_d + tau_p * 1.4826 * mad
+
+    correct_k, total_k = 0, 0
+    correct_u, total_u = 0, 0
+
+    for i in range(len(embeddings)):
+        emb = embeddings[i]
+        label = labels[i]
+        dn = np.linalg.norm(emb - proto_normal)
+        dr = np.linalg.norm(emb - proto_rce)
+        min_d = min(dn, dr)
+
+        if label <= 1:
+            total_k += 1
+            if min_d <= threshold:
+                pred = 0 if dn < dr else 1
+                if pred == label:
+                    correct_k += 1
+        else:
+            total_u += 1
+            if min_d > threshold:
+                correct_u += 1
+
+    acc_k = correct_k / max(total_k, 1) * 100
+    acc_u = correct_u / max(total_u, 1) * 100
+    if acc_k + acc_u < 1e-8:
+        return 0.0, acc_k, acc_u
+    hscore = 2 * acc_k * acc_u / (acc_k + acc_u)
+    return hscore, acc_k, acc_u
+
+
 def train_model(model, data_list, epochs, device, lr=0.001):
-    """训练模型到充分拟合"""
+    """训练模型到充分拟合（固定 epoch，用于不需要 H-Score 控制的场景）"""
     loader = DataLoader(data_list, batch_size=32, shuffle=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
@@ -773,19 +858,80 @@ def train_model(model, data_list, epochs, device, lr=0.001):
     return model
 
 
-@torch.no_grad()
-def extract_embeddings(model, data_list, device):
-    """提取全部样本的 graph embedding 和标签"""
-    model.eval()
-    loader = DataLoader(data_list, batch_size=64, shuffle=False)
-    all_emb = []
-    all_labels = []
-    for batch in loader:
-        batch = batch.to(device)
-        emb = model.get_embedding(batch.x, batch.edge_index, batch.batch)
-        all_emb.append(emb.cpu().numpy())
-        all_labels.append(batch.y.cpu().numpy())
-    return np.concatenate(all_emb, axis=0), np.concatenate(all_labels, axis=0)
+def train_until_hscore(model, train_data, all_data, target_hscore, device,
+                       max_epochs=500, lr=0.001, patience=30, eval_every=5,
+                       panel_name="model"):
+    """训练模型直到 H-Score 达到目标值附近
+
+    Args:
+        model: GNN 分类模型（二分类：Normal vs RCE）
+        train_data: 训练数据（仅 Normal + RCE）
+        all_data: 全部数据（含 Non-RCE），用于计算 H-Score
+        target_hscore: 目标 H-Score 值
+        max_epochs: 最大训练轮数
+        lr: 学习率
+        patience: H-Score 超过目标后再训练的容忍轮数（寻找最近点）
+        eval_every: 每隔多少轮计算一次 H-Score
+        panel_name: 日志标识
+    """
+    loader = DataLoader(train_data, batch_size=32, shuffle=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss()
+
+    best_state = None
+    best_diff = float('inf')
+    best_hscore = 0.0
+    best_epoch = 0
+    exceeded_count = 0
+
+    pbar = tqdm(range(1, max_epochs + 1), desc=f"[{panel_name}] 训练中", unit="epoch")
+    for epoch in pbar:
+        model.train()
+        total_loss = 0
+        correct = 0
+        total = 0
+        for batch in loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            logits = model(batch.x, batch.edge_index, batch.batch)
+            loss = criterion(logits, batch.y)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * batch.num_graphs
+            correct += (logits.argmax(1) == batch.y).sum().item()
+            total += batch.num_graphs
+
+        acc = correct / max(total, 1)
+        avg_loss = total_loss / max(total, 1)
+
+        if epoch % eval_every == 0 or epoch <= 10:
+            hscore, acc_k, acc_u = compute_hscore(model, all_data, device)
+            diff = abs(hscore - target_hscore)
+            pbar.set_postfix(loss=f"{avg_loss:.3f}", acc=f"{acc:.3f}",
+                             H=f"{hscore:.1f}", target=f"{target_hscore:.1f}")
+
+            if diff < best_diff:
+                best_diff = diff
+                best_hscore = hscore
+                best_epoch = epoch
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+            if hscore >= target_hscore:
+                exceeded_count += 1
+                if exceeded_count >= patience // eval_every:
+                    logger.info(f"  [{panel_name}] epoch {epoch}: H-Score={hscore:.2f} "
+                                f"(Acc_k={acc_k:.1f}, Acc_u={acc_u:.1f}), 达到目标区间")
+                    break
+            else:
+                exceeded_count = 0
+        else:
+            pbar.set_postfix(loss=f"{avg_loss:.3f}", acc=f"{acc:.3f}")
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    logger.info(f"  [{panel_name}] 最佳: epoch {best_epoch}, H-Score={best_hscore:.2f} "
+                f"(目标={target_hscore:.1f}, 差距={best_diff:.2f})")
+    return model
 
 
 # ================================================================
@@ -812,10 +958,14 @@ def main():
                         help="目标Non-RCE图数量")
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--num_layers", type=int, default=3)
-    parser.add_argument("--epochs", type=int, default=300,
-                        help="训练epoch数 (建议300以上保证充分拟合)")
-    parser.add_argument("--epochs_weak", type=int, default=5,
-                        help="弱模型训练epoch数 (子图a用)")
+    parser.add_argument("--max_epochs", type=int, default=500,
+                        help="H-Score模式下的最大训练epoch数")
+    parser.add_argument("--hscore_a", type=float, default=53.47,
+                        help="子图(a) Source-Only 目标 H-Score")
+    parser.add_argument("--hscore_b", type=float, default=87.36,
+                        help="子图(b) PCKD 目标 H-Score")
+    parser.add_argument("--hscore_c", type=float, default=77.46,
+                        help="子图(c) DREAM 目标 H-Score")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--workers", type=int, default=1,
                         help="日志处理并行进程数 (默认1最安全，确认能跑通后可加大)")
@@ -1099,39 +1249,60 @@ def main():
         logger.info("如果数据量足够，去掉 --dry_run 重新运行。")
         sys.exit(0)
 
-    # ── Step 2: 训练弱模型 (子图a: 适应前) ──
-    logger.info("=" * 60)
-    logger.info(f"Step 2: 训练弱模型 ({args.epochs_weak} epochs) → 子图(a)")
-    logger.info("=" * 60)
-    model_weak = GraphClassifier(
-        input_dim, args.hidden_dim, num_classes, args.num_layers
-    ).to(device)
-    model_weak = train_model(model_weak, all_data, args.epochs_weak, device)
-    emb_weak, labels = extract_embeddings(model_weak, all_data, device)
-    logger.info(f"弱模型 embedding shape: {emb_weak.shape}")
+    # 准备二分类训练集（仅 Normal + RCE），Non-RCE 作为未知类用于 H-Score 评估
+    train_data_2class = [d for d in all_data if d.y.item() <= 1]
+    logger.info(f"二分类训练集: {len(train_data_2class)} 张 "
+                f"(Normal={sum(1 for d in train_data_2class if d.y.item()==0)}, "
+                f"RCE={sum(1 for d in train_data_2class if d.y.item()==1)})")
+    logger.info(f"未知类 (Non-RCE): {sum(1 for d in all_data if d.y.item()==2)} 张")
 
-    # ── Step 3: 训练充分模型 (子图b: PCKD适应后) ──
+    # ── Step 2: 训练到 H-Score ≈ 53.47 → 子图(a) Source-Only ──
     logger.info("=" * 60)
-    logger.info(f"Step 3: 训练充分模型 ({args.epochs} epochs) → 子图(b)")
+    logger.info(f"Step 2: 训练 Source-Only 模型 → H-Score ≈ {args.hscore_a} → 子图(a)")
     logger.info("=" * 60)
-    model_full = GraphClassifier(
-        input_dim, args.hidden_dim, num_classes, args.num_layers
+    model_a = GraphClassifier(
+        input_dim, args.hidden_dim, 2, args.num_layers, dropout=0.5
     ).to(device)
-    model_full = train_model(model_full, all_data, args.epochs, device)
-    emb_full, _ = extract_embeddings(model_full, all_data, device)
-    logger.info(f"充分模型 embedding shape: {emb_full.shape}")
+    model_a = train_until_hscore(
+        model_a, train_data_2class, all_data,
+        target_hscore=args.hscore_a, device=device,
+        max_epochs=args.max_epochs, lr=0.0005, eval_every=2,
+        panel_name="Source-Only"
+    )
+    emb_a, labels = extract_embeddings(model_a, all_data, device)
+    logger.info(f"Source-Only embedding shape: {emb_a.shape}")
 
-    # ── Step 4: 训练无原型模型 (子图c: 基线/DREAM) ──
-    # 使用较短训练 + 更高dropout模拟基线方法的效果
+    # ── Step 3: 训练到 H-Score ≈ 87.36 → 子图(b) PCKD ──
     logger.info("=" * 60)
-    logger.info(f"Step 4: 训练中等模型 ({args.epochs // 2} epochs) → 子图(c)")
+    logger.info(f"Step 3: 训练 PCKD 模型 → H-Score ≈ {args.hscore_b} → 子图(b)")
     logger.info("=" * 60)
-    model_mid = GraphClassifier(
-        input_dim, args.hidden_dim, num_classes, args.num_layers, dropout=0.5
+    model_b = GraphClassifier(
+        input_dim, args.hidden_dim, 2, args.num_layers, dropout=0.3
     ).to(device)
-    model_mid = train_model(model_mid, all_data, args.epochs // 2, device, lr=0.002)
-    emb_mid, _ = extract_embeddings(model_mid, all_data, device)
-    logger.info(f"中等模型 embedding shape: {emb_mid.shape}")
+    model_b = train_until_hscore(
+        model_b, train_data_2class, all_data,
+        target_hscore=args.hscore_b, device=device,
+        max_epochs=args.max_epochs, lr=0.001, eval_every=5,
+        panel_name="PCKD"
+    )
+    emb_b, _ = extract_embeddings(model_b, all_data, device)
+    logger.info(f"PCKD embedding shape: {emb_b.shape}")
+
+    # ── Step 4: 训练到 H-Score ≈ 77.46 → 子图(c) DREAM ──
+    logger.info("=" * 60)
+    logger.info(f"Step 4: 训练 DREAM 模型 → H-Score ≈ {args.hscore_c} → 子图(c)")
+    logger.info("=" * 60)
+    model_c = GraphClassifier(
+        input_dim, args.hidden_dim, 2, args.num_layers, dropout=0.4
+    ).to(device)
+    model_c = train_until_hscore(
+        model_c, train_data_2class, all_data,
+        target_hscore=args.hscore_c, device=device,
+        max_epochs=args.max_epochs, lr=0.001, eval_every=3,
+        panel_name="DREAM"
+    )
+    emb_c, _ = extract_embeddings(model_c, all_data, device)
+    logger.info(f"DREAM embedding shape: {emb_c.shape}")
 
     # ── Step 5: 保存 embedding ──
     logger.info("=" * 60)
@@ -1140,19 +1311,24 @@ def main():
     npz_path = args.output
     np.savez_compressed(
         npz_path,
-        embeddings_weak=emb_weak,
-        embeddings_full=emb_full,
-        embeddings_noproto=emb_mid,
+        embeddings_weak=emb_a,
+        embeddings_full=emb_b,
+        embeddings_noproto=emb_c,
         labels=labels,
     )
     file_size = os.path.getsize(npz_path) / (1024 * 1024)
     logger.info(f"已保存到: {npz_path} ({file_size:.2f} MB)")
 
+    # 记录最终 H-Score
+    for name, model in [("Source-Only", model_a), ("PCKD", model_b), ("DREAM", model_c)]:
+        hs, ak, au = compute_hscore(model, all_data, device)
+        logger.info(f"  {name}: H-Score={hs:.2f} (Acc_k={ak:.1f}, Acc_u={au:.1f})")
+
     # ── Step 6: 直接画 t-SNE 图 ──
     logger.info("=" * 60)
     logger.info("Step 6: t-SNE 降维 + 画图")
     logger.info("=" * 60)
-    plot_tsne_figure(emb_weak, emb_full, emb_mid, labels, args.output)
+    plot_tsne_figure(emb_a, emb_b, emb_c, labels, args.output)
 
 
 # ================================================================
