@@ -1,0 +1,10 @@
+data/
+__pycache__/
+*.pyc
+*.npz
+*.pt
+*.pdf
+*.png
+_test_one.py
+_scan_malicious.py
+_check_data.py
