@@ -20,7 +20,7 @@ from sklearn.preprocessing import StandardScaler
 LABEL_NAMES = {0: "Normal", 1: "RCE", 2: "Non-RCE"}
 COLORS = {"Normal": "#4472C4", "RCE": "#C00000", "Non-RCE": "#808080"}
 MARKERS = {"Normal": "o", "RCE": "o", "Non-RCE": "^"}
-SIZES = {"Normal": 10, "RCE": 12, "Non-RCE": 14}
+SIZES = {"Normal": 8, "RCE": 18, "Non-RCE": 22}
 DRAW_ORDER = ["Normal", "RCE", "Non-RCE"]
 
 
@@ -95,15 +95,28 @@ def main():
     for cls in DRAW_ORDER:
         print(f"  {cls}: {(label_names == cls).sum()}")
 
-    # 采样（如果太多）
-    if len(labels_raw) > args.max_samples:
-        np.random.seed(42)
-        idx = np.random.choice(len(labels_raw), args.max_samples, replace=False)
-        emb_weak = emb_weak[idx]
-        emb_full = emb_full[idx]
-        emb_mid = emb_mid[idx]
-        label_names = label_names[idx]
-        print(f"采样到 {args.max_samples} 个点")
+    # 按类别均衡采样（保证少数类在图中清晰可见）
+    np.random.seed(42)
+    per_class = args.max_samples // 3
+    balanced_idx = []
+    for cls in DRAW_ORDER:
+        cls_idx = np.where(label_names == cls)[0]
+        if len(cls_idx) == 0:
+            continue
+        n_sample = min(per_class, len(cls_idx))
+        sampled = np.random.choice(cls_idx, n_sample, replace=False)
+        balanced_idx.extend(sampled)
+    balanced_idx = np.array(balanced_idx)
+    np.random.shuffle(balanced_idx)
+
+    emb_weak = emb_weak[balanced_idx]
+    emb_full = emb_full[balanced_idx]
+    emb_mid = emb_mid[balanced_idx]
+    label_names = label_names[balanced_idx]
+
+    for cls in DRAW_ORDER:
+        print(f"  采样后 {cls}: {(label_names == cls).sum()}")
+    print(f"  共 {len(balanced_idx)} 个点")
 
     panels = [
         (emb_weak, "(a) 适应前", False),

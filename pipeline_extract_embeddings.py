@@ -491,6 +491,19 @@ def _events_to_graphs(all_events, window_size, window_stride):
     return data_list
 
 
+def _analyze_malicious_syscalls(w_events):
+    """分析窗口内恶意事件的系统调用类型"""
+    mal_count = 0
+    has_exec = False
+    for e in w_events:
+        if _parse_malicious(e.get("malicious", False)):
+            mal_count += 1
+            if e.get("evt.type", "") in PROCESS_SYSCALLS:
+                has_exec = True
+    mal_ratio = mal_count / len(w_events) if w_events else 0.0
+    return mal_count, mal_ratio, has_exec
+
+
 def _events_to_graphs_by_count(all_events, window_events, stride_events):
     """将事件列表按固定事件数切分并构建溯源图（事件数模式）"""
     if not all_events:
@@ -506,12 +519,12 @@ def _events_to_graphs_by_count(all_events, window_events, stride_events):
             break
 
         w_events = all_events[start:end]
-        mal_count = sum(1 for e in w_events if _parse_malicious(e.get("malicious", False)))
-        mal_ratio = mal_count / len(w_events)
+        mal_count, mal_ratio, has_exec = _analyze_malicious_syscalls(w_events)
         label = 1 if mal_count > 0 else 0
         data = events_to_pyg(w_events, label)
         if data is not None:
             data.malicious_ratio = mal_ratio
+            data.has_malicious_exec = has_exec
             data_list.append(data)
 
         start += stride_events
@@ -556,9 +569,9 @@ def _process_single_item(args_tuple):
 def split_attack_to_three_classes(data_list):
     """将二分类 (Normal=0, Attack=1) 拆分为三分类 (Normal=0, RCE=1, Non-RCE=2)
 
-    策略：按恶意事件比例将攻击图分为两组
-    - 恶意比例 >= 中位数 → RCE (标签1): 典型攻击阶段（命令执行、反弹shell等）
-    - 恶意比例 < 中位数  → Non-RCE (标签2): 攻击边缘阶段（侦察、探测、信息收集等）
+    策略：基于恶意事件的系统调用类型
+    - 恶意事件中包含 execve/fork/clone 等进程创建类syscall → RCE (标签1)
+    - 恶意事件中只有文件读写/网络操作，无进程创建 → Non-RCE (标签2)
     """
     normal = [d for d in data_list if d.y.item() == 0]
     attack = [d for d in data_list if d.y.item() == 1]
@@ -567,21 +580,19 @@ def split_attack_to_three_classes(data_list):
         logger.warning("没有攻击样本 (label=1)，无法拆分三类")
         return data_list
 
-    ratios = [getattr(d, "malicious_ratio", 0.5) for d in attack]
-    median_ratio = np.median(ratios)
-    logger.info(f"攻击图恶意比例: min={min(ratios):.4f}, median={median_ratio:.4f}, max={max(ratios):.4f}")
-
     rce_count = 0
     nonrce_count = 0
-    for d, r in zip(attack, ratios):
-        if r >= median_ratio:
+    for d in attack:
+        has_exec = getattr(d, "has_malicious_exec", False)
+        if has_exec:
             d.y = torch.tensor([1], dtype=torch.long)  # RCE
             rce_count += 1
         else:
             d.y = torch.tensor([2], dtype=torch.long)  # Non-RCE
             nonrce_count += 1
 
-    logger.info(f"拆分结果: Normal={len(normal)}, RCE={rce_count}, Non-RCE={nonrce_count}")
+    logger.info(f"拆分结果 (基于syscall特征): Normal={len(normal)}, "
+                f"RCE={rce_count} (含execve/fork), Non-RCE={nonrce_count} (无进程创建)")
     return normal + attack
 
 
@@ -1159,21 +1170,32 @@ def plot_tsne_figure(emb_weak, emb_full, emb_mid, labels, output_base):
     LABEL_NAMES = {0: "Normal", 1: "RCE", 2: "Non-RCE"}
     COLORS = {"Normal": "#4472C4", "RCE": "#C00000", "Non-RCE": "#808080"}
     MARKERS = {"Normal": "o", "RCE": "o", "Non-RCE": "^"}
-    SIZES = {"Normal": 10, "RCE": 12, "Non-RCE": 14}
+    SIZES = {"Normal": 8, "RCE": 18, "Non-RCE": 22}
     DRAW_ORDER = ["Normal", "RCE", "Non-RCE"]
 
     label_names = np.array([LABEL_NAMES.get(l, f"Unk_{l}") for l in labels])
 
-    # 采样（太多点会慢且密集）
-    max_samples = 800
-    if len(labels) > max_samples:
-        np.random.seed(42)
-        idx = np.random.choice(len(labels), max_samples, replace=False)
-        emb_weak = emb_weak[idx]
-        emb_full = emb_full[idx]
-        emb_mid = emb_mid[idx]
-        label_names = label_names[idx]
-        logger.info(f"采样到 {max_samples} 个点")
+    # 按类别均衡采样（保证少数类在图中清晰可见）
+    np.random.seed(42)
+    per_class = 250
+    balanced_idx = []
+    for cls in DRAW_ORDER:
+        cls_idx = np.where(label_names == cls)[0]
+        if len(cls_idx) == 0:
+            continue
+        n_sample = min(per_class, len(cls_idx))
+        sampled = np.random.choice(cls_idx, n_sample, replace=False)
+        balanced_idx.extend(sampled)
+    balanced_idx = np.array(balanced_idx)
+    np.random.shuffle(balanced_idx)
+
+    emb_weak = emb_weak[balanced_idx]
+    emb_full = emb_full[balanced_idx]
+    emb_mid = emb_mid[balanced_idx]
+    label_names = label_names[balanced_idx]
+
+    counts = {cls: (label_names == cls).sum() for cls in DRAW_ORDER}
+    logger.info(f"t-SNE 均衡采样: {dict(counts)}, 共 {len(balanced_idx)} 个点")
 
     def do_tsne(features):
         scaled = StandardScaler().fit_transform(features)
