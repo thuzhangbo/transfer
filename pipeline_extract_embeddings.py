@@ -461,7 +461,7 @@ def _extract_tar_with_progress(tar_path, dest_dir):
 
 
 def _events_to_graphs(all_events, window_size, window_stride):
-    """将事件列表按时间窗口切分并构建溯源图"""
+    """将事件列表按时间窗口切分并构建溯源图（时间模式）"""
     if not all_events:
         return []
 
@@ -491,20 +491,58 @@ def _events_to_graphs(all_events, window_size, window_stride):
     return data_list
 
 
+def _events_to_graphs_by_count(all_events, window_events, stride_events):
+    """将事件列表按固定事件数切分并构建溯源图（事件数模式）"""
+    if not all_events:
+        return []
+
+    n = len(all_events)
+    data_list = []
+    start = 0
+
+    while start < n:
+        end = min(start + window_events, n)
+        if end - start < window_events // 2:
+            break
+
+        w_events = all_events[start:end]
+        mal_count = sum(1 for e in w_events if _parse_malicious(e.get("malicious", False)))
+        mal_ratio = mal_count / len(w_events)
+        label = 1 if mal_count > 0 else 0
+        data = events_to_pyg(w_events, label)
+        if data is not None:
+            data.malicious_ratio = mal_ratio
+            data_list.append(data)
+
+        start += stride_events
+
+    return data_list
+
+
 def _process_single_item(args_tuple):
     """单个 tar.gz / 目录的处理函数（供多进程调用）"""
-    full_path, item, window_size, window_stride = args_tuple
+    full_path, item, window_size, window_stride, use_event_count = args_tuple
     try:
         if item.endswith(".tar.gz") or item.endswith(".tgz"):
-            # 直接从 tar 内流式读取，不解压到磁盘
             all_events = _load_events_from_tar(full_path)
             logger.info(f"    开始构建溯源图: {item}")
-            graphs = _events_to_graphs(all_events, window_size, window_stride)
+            if use_event_count:
+                graphs = _events_to_graphs_by_count(all_events, window_size, window_stride)
+            else:
+                graphs = _events_to_graphs(all_events, window_size, window_stride)
         elif os.path.isdir(full_path):
             sysdig_dir = os.path.join(full_path, "sysdig")
             target = sysdig_dir if os.path.isdir(sysdig_dir) else full_path
             logger.info(f"    开始构建溯源图: {item}")
-            graphs = process_log_dir(target, window_size, window_stride)
+            if use_event_count:
+                all_events = []
+                for pat in ["*.jsonl", "*.json", "*.log"]:
+                    for fp in sorted(glob.glob(os.path.join(target, "**", pat), recursive=True)):
+                        all_events.extend(load_log_file(fp))
+                all_events.sort(key=lambda e: e["_timestamp"])
+                graphs = _events_to_graphs_by_count(all_events, window_size, window_stride)
+            else:
+                graphs = process_log_dir(target, window_size, window_stride)
         else:
             graphs = []
         return item, graphs
@@ -547,7 +585,50 @@ def split_attack_to_three_classes(data_list):
     return normal + attack
 
 
-def load_data_from_autolabel(data_dir, window_size=300, window_stride=150, num_workers=1):
+def subsample_to_target(data_list, target_normal, target_rce, target_nonrce, seed=42):
+    """精确采样各类别到目标数量
+
+    如果某类数量不足，则全部保留并发出警告。
+    如果某类数量过多，随机采样到目标数量。
+    """
+    import random
+    random.seed(seed)
+
+    normal = [d for d in data_list if d.y.item() == 0]
+    rce = [d for d in data_list if d.y.item() == 1]
+    nonrce = [d for d in data_list if d.y.item() == 2]
+
+    logger.info(f"采样前: Normal={len(normal)}, RCE={len(rce)}, Non-RCE={len(nonrce)}")
+    logger.info(f"目标:   Normal={target_normal}, RCE={target_rce}, Non-RCE={target_nonrce}")
+
+    def _sample(items, target, name):
+        if len(items) < target:
+            logger.warning(f"  {name}: 数量不足 ({len(items)} < {target})，全部保留")
+            return items
+        elif len(items) == target:
+            return items
+        else:
+            sampled = random.sample(items, target)
+            logger.info(f"  {name}: {len(items)} → {target}")
+            return sampled
+
+    normal = _sample(normal, target_normal, "Normal")
+    rce = _sample(rce, target_rce, "RCE")
+    nonrce = _sample(nonrce, target_nonrce, "Non-RCE")
+
+    result = normal + rce + nonrce
+    random.shuffle(result)
+
+    total = len(result)
+    logger.info(f"采样后: 总计={total} "
+                f"(Normal={len([d for d in result if d.y.item()==0])}, "
+                f"RCE={len([d for d in result if d.y.item()==1])}, "
+                f"Non-RCE={len([d for d in result if d.y.item()==2])})")
+    return result
+
+
+def load_data_from_autolabel(data_dir, window_size=300, window_stride=150,
+                             num_workers=1, use_event_count=False):
     """加载 autolabel 输出目录：支持 tar.gz 和已解压目录"""
     all_data = []
 
@@ -556,7 +637,7 @@ def load_data_from_autolabel(data_dir, window_size=300, window_stride=150, num_w
     for item in items:
         full_path = os.path.join(data_dir, item)
         if item.endswith((".tar.gz", ".tgz")) or os.path.isdir(full_path):
-            valid_items.append((full_path, item, window_size, window_stride))
+            valid_items.append((full_path, item, window_size, window_stride, use_event_count))
 
     logger.info(f"在 {data_dir} 下发现 {len(valid_items)} 个有效条目")
 
@@ -706,10 +787,18 @@ def main():
                         help="autolabel输出目录 (包含tar.gz或解压后的子目录)")
     parser.add_argument("--output", default="embeddings_for_tsne.npz",
                         help="输出文件路径")
-    parser.add_argument("--window_size", type=int, default=300,
-                        help="时间窗口大小(秒)")
-    parser.add_argument("--window_stride", type=int, default=150,
-                        help="窗口步长(秒)")
+    parser.add_argument("--window_size", type=int, default=2156,
+                        help="窗口大小 (--event_count模式下为事件数，否则为秒)")
+    parser.add_argument("--window_stride", type=int, default=2156,
+                        help="窗口步长 (--event_count模式下为事件数，否则为秒)")
+    parser.add_argument("--event_count", action="store_true",
+                        help="按固定事件数切分而非时间窗口切分")
+    parser.add_argument("--target_normal", type=int, default=43625,
+                        help="目标Normal图数量")
+    parser.add_argument("--target_rce", type=int, default=652,
+                        help="目标RCE图数量")
+    parser.add_argument("--target_nonrce", type=int, default=241,
+                        help="目标Non-RCE图数量")
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=300,
@@ -936,9 +1025,14 @@ def main():
     # ── Step 1: 加载数据 ──
     logger.info("=" * 60)
     logger.info("Step 1: 加载 autolabel 数据 → 构建溯源图")
+    if args.event_count:
+        logger.info(f"  切分模式: 按事件数 (窗口={args.window_size}条, 步长={args.window_stride}条)")
+    else:
+        logger.info(f"  切分模式: 按时间 (窗口={args.window_size}秒, 步长={args.window_stride}秒)")
     logger.info("=" * 60)
     all_data = load_data_from_autolabel(args.data_dir, args.window_size, args.window_stride,
-                                            num_workers=args.workers)
+                                            num_workers=args.workers,
+                                            use_event_count=args.event_count)
 
     if not all_data:
         logger.error("未生成任何有效图数据，请检查 data_dir 路径和日志格式")
@@ -950,13 +1044,29 @@ def main():
         logger.info("检测到二分类数据 (Normal=0, Attack=1)，自动拆分为三分类...")
         all_data = split_attack_to_three_classes(all_data)
 
+    # 详细统计（采样前）
+    label_names_map = {0: "Normal", 1: "RCE", 2: "Non-RCE"}
+    logger.info(f"\n{'='*60}")
+    logger.info(f"数据统计（采样前）")
+    logger.info(f"{'='*60}")
+    logger.info(f"  总图数: {len(all_data)}")
+    for c in sorted(set(d.y.item() for d in all_data)):
+        count = sum(1 for d in all_data if d.y.item() == c)
+        logger.info(f"    {label_names_map.get(c, f'Class_{c}')}: {count} 张")
+
+    # 精确采样到目标数量
+    target_total = args.target_normal + args.target_rce + args.target_nonrce
+    logger.info(f"\n目标总数: {target_total} (Normal={args.target_normal}, "
+                f"RCE={args.target_rce}, Non-RCE={args.target_nonrce})")
+    all_data = subsample_to_target(
+        all_data, args.target_normal, args.target_rce, args.target_nonrce
+    )
+
     num_classes = len(set(d.y.item() for d in all_data))
     input_dim = all_data[0].x.shape[1]
 
-    # 详细统计
-    label_names_map = {0: "Normal", 1: "RCE", 2: "Non-RCE"}
     logger.info(f"\n{'='*60}")
-    logger.info(f"数据统计")
+    logger.info(f"最终数据统计")
     logger.info(f"{'='*60}")
     logger.info(f"  总图数: {len(all_data)}")
     logger.info(f"  节点特征维度: {input_dim}")
@@ -975,8 +1085,7 @@ def main():
 
     if args.dry_run:
         logger.info("--dry_run 模式，仅统计，不训练。")
-        logger.info("如果数据量足够（建议每类 >= 50 张），去掉 --dry_run 重新运行。")
-        logger.info("如果图太少，可以减小窗口参数: --window_size 150 --window_stride 75")
+        logger.info("如果数据量足够，去掉 --dry_run 重新运行。")
         sys.exit(0)
 
     # ── Step 2: 训练弱模型 (子图a: 适应前) ──
